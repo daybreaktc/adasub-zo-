@@ -146,8 +146,6 @@ class OurTrainer(Trainer):
         # Scalar adaptive step size state (ZO-Adam-like second moment for scalar g)
         self.zo_v = 0.0           # Second moment estimate for Phase 2 scalar gradient
         self.zo_scalar_t = 0      # Step counter for Phase 2 bias correction
-        self.zo_v_phase1 = 0.0    # Second moment estimate for Phase 1 scalar gradient
-        self.zo_scalar_t_phase1 = 0  # Step counter for Phase 1 bias correction
         
     def _inner_training_loop(
             self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -1053,10 +1051,6 @@ class OurTrainer(Trainer):
         with torch.no_grad():
             initial_loss = self.zo_forward(model, inputs)
         
-        # Reset Phase 1 scalar adaptive state at the start of each subspace learning cycle
-        self.zo_v_phase1 = 0.0
-        self.zo_scalar_t_phase1 = 0
-
         # 3. 优化循环 (Learning Loop)
         for i in range(args.adasub_iter):
             # ... (这部分采样代码保持不变) ...
@@ -1108,17 +1102,10 @@ class OurTrainer(Trainer):
             
             scalar_grad = (loss_pos - initial_loss) / (args.adasub_sigma) # 粗略估计
 
-            # Scalar adaptive step size for Phase 1
-            self.zo_scalar_t_phase1 += 1
-            self.zo_v_phase1 = args.zo_beta2 * self.zo_v_phase1 + (1 - args.zo_beta2) * (scalar_grad ** 2)
-            bias_correction2 = 1 - args.zo_beta2 ** self.zo_scalar_t_phase1
-            scalar_grad_adaptive = scalar_grad / (math.sqrt(self.zo_v_phase1 / bias_correction2) + args.zo_scalar_eps)
-
-            # 更新 U, V (使用自适应标量步长)
+            # 更新 U, V (使用原始标量梯度，不做自适应归一化)
             for name in target_params:
-                # Gradient Descent: U = U - lr * adaptive_grad
-                self.p_state[name]['U'] -= args.adasub_lr * scalar_grad_adaptive * perturbations[name]['Z_U']
-                self.p_state[name]['V'] -= args.adasub_lr * scalar_grad_adaptive * perturbations[name]['Z_V']
+                self.p_state[name]['U'] -= args.adasub_lr * scalar_grad * perturbations[name]['Z_U']
+                self.p_state[name]['V'] -= args.adasub_lr * scalar_grad * perturbations[name]['Z_V']
     
         # 【新增】DEBUG: 计算最终 Loss (验收成果)
         with torch.no_grad():
@@ -1260,7 +1247,12 @@ class OurTrainer(Trainer):
             # TRIGGER PHASE 1: Learn U and V
             print(f"--> Triggering AdaSub Phase 1: Learning Subspace at step {self.state.global_step}")
             self.train_subspace_basis(model, inputs)
-            
+
+            # Reset Phase 2 scalar adaptive state: old subspace statistics are stale
+            self.zo_v = 0.0
+            self.zo_scalar_t = 0
+            print(f"    [Reset] Phase 2 adaptive state (zo_v, zo_scalar_t) reset after subspace update.")
+
             # Clear gradient buffer after subspace learning to avoid stale grads affecting Phase 2
             model.zero_grad()
 
