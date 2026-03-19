@@ -116,10 +116,7 @@ class OurArguments(TrainingArguments):
     adasub_iter: int = 10       # How many optimization steps to learn U and V per cycle
     adasub_alpha: float = 1e-3  # The probe step size (alpha) in the objective function
     adasub_sigma: float = 1e-2  # Perturbation scale (nu) for ZO estimation of U and V
-
-    # Scalar Adaptive Step Size (ZO-Adam-like scalar normalization)
-    zo_beta2: float = 0.999     # Decay rate for second moment of scalar gradient g
-    zo_scalar_eps: float = 1e-8 # Epsilon for numerical stability in adaptive step
+    adasub_beta: float = 0.9    # Momentum coefficient for Subspace Fusion
     # ------------------------------------
 
     # Generation
