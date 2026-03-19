@@ -143,6 +143,11 @@ class OurTrainer(Trainer):
         self.writer = writer
         self.p_state = dict()
         self.update_steps = 0
+        # Scalar adaptive step size state (ZO-Adam-like second moment for scalar g)
+        self.zo_v = 0.0           # Second moment estimate for Phase 2 scalar gradient
+        self.zo_scalar_t = 0      # Step counter for Phase 2 bias correction
+        self.zo_v_phase1 = 0.0    # Second moment estimate for Phase 1 scalar gradient
+        self.zo_scalar_t_phase1 = 0  # Step counter for Phase 1 bias correction
         
     def _inner_training_loop(
             self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -1048,6 +1053,10 @@ class OurTrainer(Trainer):
         with torch.no_grad():
             initial_loss = self.zo_forward(model, inputs)
         
+        # Reset Phase 1 scalar adaptive state at the start of each subspace learning cycle
+        self.zo_v_phase1 = 0.0
+        self.zo_scalar_t_phase1 = 0
+
         # 3. 优化循环 (Learning Loop)
         for i in range(args.adasub_iter):
             # ... (这部分采样代码保持不变) ...
@@ -1098,12 +1107,18 @@ class OurTrainer(Trainer):
             # 实际上直接用 loss 差值做标量指引即可
             
             scalar_grad = (loss_pos - initial_loss) / (args.adasub_sigma) # 粗略估计
-            
-            # 更新 U, V
+
+            # Scalar adaptive step size for Phase 1
+            self.zo_scalar_t_phase1 += 1
+            self.zo_v_phase1 = args.zo_beta2 * self.zo_v_phase1 + (1 - args.zo_beta2) * (scalar_grad ** 2)
+            bias_correction2 = 1 - args.zo_beta2 ** self.zo_scalar_t_phase1
+            scalar_grad_adaptive = scalar_grad / (math.sqrt(self.zo_v_phase1 / bias_correction2) + args.zo_scalar_eps)
+
+            # 更新 U, V (使用自适应标量步长)
             for name in target_params:
-                # Gradient Descent: U = U - lr * grad
-                self.p_state[name]['U'] -= args.adasub_lr * scalar_grad * perturbations[name]['Z_U']
-                self.p_state[name]['V'] -= args.adasub_lr * scalar_grad * perturbations[name]['Z_V']
+                # Gradient Descent: U = U - lr * adaptive_grad
+                self.p_state[name]['U'] -= args.adasub_lr * scalar_grad_adaptive * perturbations[name]['Z_U']
+                self.p_state[name]['V'] -= args.adasub_lr * scalar_grad_adaptive * perturbations[name]['Z_V']
     
         # 【新增】DEBUG: 计算最终 Loss (验收成果)
         with torch.no_grad():
@@ -1324,24 +1339,30 @@ class OurTrainer(Trainer):
         # model.zero_grad()
 
     def zo_subspace_update(self, model):
-        
+
         args = self.args
+
+        # Scalar adaptive step size: normalize g by its running second moment
+        g = self.projected_grad
+        self.zo_scalar_t += 1
+        self.zo_v = args.zo_beta2 * self.zo_v + (1 - args.zo_beta2) * (g ** 2)
+        bias_correction2 = 1 - args.zo_beta2 ** self.zo_scalar_t
+        g_adaptive = g / (math.sqrt(self.zo_v / bias_correction2) + args.zo_scalar_eps)
+
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(self.zo_random_seed)
         for name, param, U, V in self.named_parameters_to_optim:
             # Resample z
-            if len(torch.squeeze(param.data).shape) == 2:    
+            if len(torch.squeeze(param.data).shape) == 2:
                 z0 = torch.normal(mean=0, std=1, size=(args.gauss_rank, args.gauss_rank), device=param.data.device, dtype=param.data.dtype)
-                # z = U @ z0 @ V * math.sqrt(param.data.numel() / z0.numel())
                 z = (U @ z0 @ V * math.sqrt(param.data.numel() / z0.numel())).view(param.data.shape).to(param.data.dtype)
 
             else:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device,
                              dtype=param.data.dtype)
 
-            param.grad = self.projected_grad * z  # NOTE this q division does not work for q>1.
-            self.optimizer.step()  # will only update grad that is not None.
-            # param.data = param.data - graddiff_times_z / args.q  # NOTE this q division does not work for q>1.
+            param.grad = g_adaptive * z
+            self.optimizer.step()
             param.grad = None  # avoid further update.
             
         self.update_steps += 1
