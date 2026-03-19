@@ -142,6 +142,7 @@ class OurTrainer(Trainer):
         self.eval_samples = eval_samples
         self.writer = writer
         self.p_state = dict()
+        self.zo_subspace_momentum = {}  # r×r momentum buffer per layer (in subspace)
         self.update_steps = 0
         
     def _inner_training_loop(
@@ -1060,7 +1061,6 @@ class OurTrainer(Trainer):
                 perturbations[name] = {
                     'Z_U': torch.randn_like(U),
                     'Z_V': torch.randn_like(V),
-                    'Z_core': torch.randn((args.gauss_rank, args.gauss_rank), device=U.device, dtype=U.dtype)
                 }
     
             original_weights = {}
@@ -1071,23 +1071,21 @@ class OurTrainer(Trainer):
                     original_weights[name] = param.data.clone()
                     U_new = self.p_state[name]['U'] + args.adasub_sigma * perturbations[name]['Z_U']
                     V_new = self.p_state[name]['V'] + args.adasub_sigma * perturbations[name]['Z_V']
-                    Z_core = perturbations[name]['Z_core']
-                    
-                    update_matrix = U_new @ Z_core @ V_new
+
+                    update_matrix = U_new @ V_new
                     norm = torch.norm(update_matrix, p='fro') + 1e-6
                     update_matrix = update_matrix / norm
                     param.data = param.data + args.adasub_alpha * update_matrix
-    
+
             loss_pos = self.zo_forward(model, inputs)
-            
+
             # ===== B. 反向扰动 (loss_neg) =====
             for name, param in model.named_parameters():
                 if name in target_params:
                     U_new = self.p_state[name]['U'] - args.adasub_sigma * perturbations[name]['Z_U']
                     V_new = self.p_state[name]['V'] - args.adasub_sigma * perturbations[name]['Z_V']
-                    Z_core = perturbations[name]['Z_core']
-                    
-                    update_matrix = U_new @ Z_core @ V_new
+
+                    update_matrix = U_new @ V_new
                     norm = torch.norm(update_matrix, p='fro') + 1e-6
                     update_matrix = update_matrix / norm
                     param.data = original_weights[name] + args.adasub_alpha * update_matrix
@@ -1235,10 +1233,32 @@ class OurTrainer(Trainer):
                      self.p_state[name] = {'U': None, 'V': None}
 
         if is_time_to_update:
+            # Save old U, V for momentum projection
+            old_UV = {}
+            for name in self.p_state:
+                if self.p_state[name].get('U') is not None:
+                    old_UV[name] = (
+                        self.p_state[name]['U'].clone(),
+                        self.p_state[name]['V'].clone(),
+                    )
+
             # TRIGGER PHASE 1: Learn U and V
             print(f"--> Triggering AdaSub Phase 1: Learning Subspace at step {self.state.global_step}")
             self.train_subspace_basis(model, inputs)
-            
+
+            # Project Phase 2 subspace momentum into the new basis
+            # Old direction in param space: U_old @ m @ V_old
+            # New representation: m_new = (U_new^T @ U_old) @ m @ (V_old @ V_new^T)
+            for name in list(self.zo_subspace_momentum.keys()):
+                if name in old_UV and name in self.p_state:
+                    U_old, V_old = old_UV[name]
+                    U_new = self.p_state[name]['U']
+                    V_new = self.p_state[name]['V']
+                    m_old = self.zo_subspace_momentum[name]
+                    self.zo_subspace_momentum[name] = (
+                        (U_new.T @ U_old) @ m_old @ (V_old @ V_new.T)
+                    )
+
             # Clear gradient buffer after subspace learning to avoid stale grads affecting Phase 2
             model.zero_grad()
 
@@ -1317,34 +1337,51 @@ class OurTrainer(Trainer):
         # model.zero_grad()
 
     def zo_subspace_update(self, model):
-        
+        """
+        Update parameters with subspace-internal momentum.
+        For 2D params: accumulate projected_grad * z0 in the r×r subspace where
+        directions are consistent across steps, then project back via U @ m @ V.
+        This avoids the problem where SGD momentum in full parameter space
+        cancels out due to random z changing every step.
+        """
         args = self.args
+        beta_m = getattr(args, 'adasub_beta', 0.9)
+        lr = args.learning_rate
+
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(self.zo_random_seed)
         for name, param, U, V in self.named_parameters_to_optim:
-            # Resample z
-            if len(torch.squeeze(param.data).shape) == 2:    
-                z0 = torch.normal(mean=0, std=1, size=(args.gauss_rank, args.gauss_rank), device=param.data.device, dtype=param.data.dtype)
-                # z = U @ z0 @ V * math.sqrt(param.data.numel() / z0.numel())
-                z = (U @ z0 @ V * math.sqrt(param.data.numel() / z0.numel())).view(param.data.shape).to(param.data.dtype)
+            if len(torch.squeeze(param.data).shape) == 2:
+                # Sample z0 in subspace (must match the seed used in perturb)
+                z0 = torch.normal(mean=0, std=1, size=(U.shape[1], V.shape[0]),
+                                  device=param.data.device, dtype=param.data.dtype)
+                scale = math.sqrt(param.data.numel() / z0.numel())
 
+                # Accumulate gradient in the r×r subspace (momentum here is effective
+                # because the basis U/V is stable between update_interval steps)
+                grad_subspace = self.projected_grad * z0
+                if name not in self.zo_subspace_momentum:
+                    self.zo_subspace_momentum[name] = torch.zeros_like(z0)
+                self.zo_subspace_momentum[name] = (
+                    beta_m * self.zo_subspace_momentum[name] + grad_subspace
+                )
+
+                # Project momentum back to full parameter space and update
+                update = (U @ self.zo_subspace_momentum[name] @ V * scale).view(
+                    param.data.shape).to(param.data.dtype)
+                param.data -= lr * update
             else:
-                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device,
-                             dtype=param.data.dtype)
+                # 1D params (bias/layernorm): standard ZO update via optimizer
+                z = torch.normal(mean=0, std=1, size=param.data.size(),
+                                 device=param.data.device, dtype=param.data.dtype)
+                param.grad = self.projected_grad * z
+                self.optimizer.step()
+                param.grad = None
 
-            param.grad = self.projected_grad * z  # NOTE this q division does not work for q>1.
-            self.optimizer.step()  # will only update grad that is not None.
-            # param.data = param.data - graddiff_times_z / args.q  # NOTE this q division does not work for q>1.
-            param.grad = None  # avoid further update.
-            
         self.update_steps += 1
         if self.update_steps % 1000 == 0:
             print('model update', self.update_steps)
-        # self.optimizer.step()
-        # print(type(self.optimizer), self.optimizer)
-        self.lr_scheduler.step()  # NOTE When we use own optimizer, this will no longer update the lr anymore.
-        # self.optimizer.zero_grad()
-        # model.zero_grad()
+        self.lr_scheduler.step()
         
     @staticmethod
     @torch.no_grad()
