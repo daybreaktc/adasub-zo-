@@ -1343,11 +1343,20 @@ class OurTrainer(Trainer):
         args = self.args
 
         # Scalar adaptive step size: normalize g by its running second moment
+        # v ← β₂v + (1-β₂)g²
+        # g_adaptive = g / (√(v / bias_correction) + ε)
+        # Then: param ← param - zo_adaptive_lr * g_adaptive * z  (manual update, bypass optimizer)
         g = self.projected_grad
         self.zo_scalar_t += 1
         self.zo_v = args.zo_beta2 * self.zo_v + (1 - args.zo_beta2) * (g ** 2)
         bias_correction2 = 1 - args.zo_beta2 ** self.zo_scalar_t
         g_adaptive = g / (math.sqrt(self.zo_v / bias_correction2) + args.zo_scalar_eps)
+
+        # Debug: print adaptive stats periodically
+        if self.update_steps % 100 == 0:
+            rms_g = math.sqrt(self.zo_v / bias_correction2)
+            print(f"  [Adaptive] step={self.update_steps}, g={g:.4f}, rms(g)={rms_g:.4f}, "
+                  f"g_adaptive={g_adaptive:.4f}, effective_lr={args.zo_adaptive_lr:.6f}")
 
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(self.zo_random_seed)
@@ -1361,18 +1370,14 @@ class OurTrainer(Trainer):
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device,
                              dtype=param.data.dtype)
 
-            param.grad = g_adaptive * z
-            self.optimizer.step()
-            param.grad = None  # avoid further update.
-            
+            # Manual update: param ← param - zo_adaptive_lr * g_adaptive * z
+            # Bypasses SGD optimizer to avoid lr * sign(g) ≈ 1e-6 problem
+            param.data -= args.zo_adaptive_lr * g_adaptive * z
+
         self.update_steps += 1
         if self.update_steps % 1000 == 0:
             print('model update', self.update_steps)
-        # self.optimizer.step()
-        # print(type(self.optimizer), self.optimizer)
-        self.lr_scheduler.step()  # NOTE When we use own optimizer, this will no longer update the lr anymore.
-        # self.optimizer.zero_grad()
-        # model.zero_grad()
+        self.lr_scheduler.step()
         
     @staticmethod
     @torch.no_grad()

@@ -120,6 +120,7 @@ class OurArguments(TrainingArguments):
     # Scalar Adaptive Step Size (ZO-Adam-like scalar normalization)
     zo_beta2: float = 0.999     # Decay rate for second moment of scalar gradient g
     zo_scalar_eps: float = 1e-8 # Epsilon for numerical stability in adaptive step
+    zo_adaptive_lr: float = 1e-4  # Learning rate for Phase 2 adaptive update (bypasses optimizer)
     # ------------------------------------
 
     # Generation
