@@ -1244,16 +1244,37 @@ class OurTrainer(Trainer):
                      self.p_state[name] = {'U': None, 'V': None}
 
         if is_time_to_update:
-            # TRIGGER PHASE 1: Learn U and V
-            print(f"--> Triggering AdaSub Phase 1: Learning Subspace at step {self.state.global_step}")
-            self.train_subspace_basis(model, inputs)
+            is_first_init = any(self.p_state[name]['U'] is None for name in self.p_state)
 
-            # Reset Phase 2 scalar adaptive state: old subspace statistics are stale
+            if is_first_init:
+                # First call: full Phase 1 learning to initialize U, V from scratch
+                print(f"--> Triggering AdaSub Phase 1: Learning Subspace at step {self.state.global_step}")
+                self.train_subspace_basis(model, inputs)
+            else:
+                # Subsequent calls: only QR re-orthogonalize existing U, V
+                # Phase 1 SGD is too noisy (10 iterations, single-sample gradients)
+                # and consistently destroys the effective subspace learned during Phase 2
+                print(f"--> Step {self.state.global_step}: Re-orthogonalizing subspace (skip Phase 1 relearning)")
+                target_params = [name for name, p in model.named_parameters()
+                                 if p.requires_grad and len(p.shape) == 2]
+                for name in target_params:
+                    with torch.no_grad():
+                        U_final = self.p_state[name]['U']
+                        V_final = self.p_state[name]['V']
+
+                        Q_u, _ = torch.linalg.qr(U_final)
+                        self.p_state[name]['U'] = Q_u[:, :args.gauss_rank].contiguous()
+
+                        Q_v, _ = torch.linalg.qr(V_final.T)
+                        self.p_state[name]['V'] = Q_v[:, :args.gauss_rank].T.contiguous()
+                print(f"    Subspace re-orthogonalized (U, V unchanged in span, only QR cleanup).")
+
+            # Reset Phase 2 scalar adaptive state: subspace may have shifted after QR
             self.zo_v = 0.0
             self.zo_scalar_t = 0
             print(f"    [Reset] Phase 2 adaptive state (zo_v, zo_scalar_t) reset after subspace update.")
 
-            # Clear gradient buffer after subspace learning to avoid stale grads affecting Phase 2
+            # Clear gradient buffer
             model.zero_grad()
 
         # 2. Phase 2: Standard SubZero Traversal using the LEARNED U, V
