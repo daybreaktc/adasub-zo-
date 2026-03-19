@@ -1250,32 +1250,14 @@ class OurTrainer(Trainer):
                 # First call: full Phase 1 learning to initialize U, V from scratch
                 print(f"--> Triggering AdaSub Phase 1: Learning Subspace at step {self.state.global_step}")
                 self.train_subspace_basis(model, inputs)
+                model.zero_grad()
             else:
-                # Subsequent calls: only QR re-orthogonalize existing U, V
-                # Phase 1 SGD is too noisy (10 iterations, single-sample gradients)
-                # and consistently destroys the effective subspace learned during Phase 2
-                print(f"--> Step {self.state.global_step}: Re-orthogonalizing subspace (skip Phase 1 relearning)")
-                target_params = [name for name, p in model.named_parameters()
-                                 if p.requires_grad and len(p.shape) == 2]
-                for name in target_params:
-                    with torch.no_grad():
-                        U_final = self.p_state[name]['U']
-                        V_final = self.p_state[name]['V']
-
-                        Q_u, _ = torch.linalg.qr(U_final)
-                        self.p_state[name]['U'] = Q_u[:, :args.gauss_rank].contiguous()
-
-                        Q_v, _ = torch.linalg.qr(V_final.T)
-                        self.p_state[name]['V'] = Q_v[:, :args.gauss_rank].T.contiguous()
-                print(f"    Subspace re-orthogonalized (U, V unchanged in span, only QR cleanup).")
-
-            # Reset Phase 2 scalar adaptive state: subspace may have shifted after QR
-            self.zo_v = 0.0
-            self.zo_scalar_t = 0
-            print(f"    [Reset] Phase 2 adaptive state (zo_v, zo_scalar_t) reset after subspace update.")
-
-            # Clear gradient buffer
-            model.zero_grad()
+                # Subsequent intervals: do NOTHING.
+                # QR re-orthogonalization changes U,V values (column normalization),
+                # and zo_v reset destroys accumulated adaptive statistics.
+                # Both consistently cause loss to rise after the boundary.
+                # The initial subspace + continuous adaptive state works well — don't disrupt it.
+                pass
 
         # 2. Phase 2: Standard SubZero Traversal using the LEARNED U, V
         # What parameters to optimize
