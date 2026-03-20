@@ -1285,24 +1285,55 @@ class OurTrainer(Trainer):
         # Sample the random seed for sampling z
         self.zo_random_seed = np.random.randint(1000000000)
 
-        # First function evaluation
-        self.zo_subspace_perturb_parameters(scaling_factor=1)
-        loss1 = self.zo_forward(model, inputs)
+        q = getattr(args, 'q', 1)
 
-        # Second function evaluation
-        assert args.q == 1, "only support q=1 for memory efficiency"
-        
-        if self.args.perturbation_mode == "one_side":
-            self.zo_subspace_perturb_parameters(scaling_factor=-1)
-            loss2 = self.zo_forward(model, inputs)
-            self.projected_grad = ((loss1 - loss2) / self.args.zo_eps).item()
-        else:  # two side perturbation
-            self.zo_subspace_perturb_parameters(scaling_factor=-2)
-            loss2 = self.zo_forward(model, inputs)
-            self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
-
-            # Reset model back to its parameters at start of step
+        if q == 1:
+            # Original single-perturbation path (unchanged)
+            # First function evaluation
             self.zo_subspace_perturb_parameters(scaling_factor=1)
+            loss1 = self.zo_forward(model, inputs)
+
+            if self.args.perturbation_mode == "one_side":
+                self.zo_subspace_perturb_parameters(scaling_factor=-1)
+                loss2 = self.zo_forward(model, inputs)
+                self.projected_grad = ((loss1 - loss2) / self.args.zo_eps).item()
+            else:  # two side perturbation
+                self.zo_subspace_perturb_parameters(scaling_factor=-2)
+                loss2 = self.zo_forward(model, inputs)
+                self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+                # Reset model back to its parameters at start of step
+                self.zo_subspace_perturb_parameters(scaling_factor=1)
+
+            # Store single seed for update
+            self.zo_random_seeds = [self.zo_random_seed]
+            self.projected_grads = [self.projected_grad]
+        else:
+            # Multi-perturbation: q independent perturbations, average the gradient
+            self.zo_random_seeds = []
+            self.projected_grads = []
+
+            for _ in range(q):
+                seed_i = np.random.randint(1000000000)
+                self.zo_random_seed = seed_i
+                self.zo_random_seeds.append(seed_i)
+
+                self.zo_subspace_perturb_parameters(scaling_factor=1)
+                loss1 = self.zo_forward(model, inputs)
+
+                if self.args.perturbation_mode == "one_side":
+                    self.zo_subspace_perturb_parameters(scaling_factor=-1)
+                    loss2 = self.zo_forward(model, inputs)
+                    grad_i = ((loss1 - loss2) / self.args.zo_eps).item()
+                else:
+                    self.zo_subspace_perturb_parameters(scaling_factor=-2)
+                    loss2 = self.zo_forward(model, inputs)
+                    grad_i = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+                    self.zo_subspace_perturb_parameters(scaling_factor=1)
+
+                self.projected_grads.append(grad_i)
+
+            # For backward compat, set projected_grad to the average
+            self.projected_grad = sum(self.projected_grads) / q
 
         return loss1
 
@@ -1360,22 +1391,34 @@ class OurTrainer(Trainer):
         else:
             lr = args.learning_rate
 
-        # Set the random seed to ensure that we sample the same z for perturbation/update
-        torch.manual_seed(self.zo_random_seed)
+        # Multi-perturbation: accumulate gradient from all q directions
+        seeds = getattr(self, 'zo_random_seeds', [self.zo_random_seed])
+        grads = getattr(self, 'projected_grads', [self.projected_grad])
+        q = len(seeds)
+
         for name, param, U, V in self.named_parameters_to_optim:
             if len(torch.squeeze(param.data).shape) == 2:
-                # Sample z0 in subspace (must match the seed used in perturb)
-                z0 = torch.normal(mean=0, std=1, size=(U.shape[1], V.shape[0]),
-                                  device=param.data.device, dtype=param.data.dtype)
-                scale = math.sqrt(param.data.numel() / z0.numel())
+                scale = math.sqrt(param.data.numel() / (U.shape[1] * V.shape[0]))
 
-                # Standard SGD momentum: m = beta*m + g (no Nesterov, avoids noise amplification in ZO)
-                grad_subspace = self.projected_grad * z0
+                # Average gradient over q perturbations
+                avg_grad_subspace = None
+                for seed_i, grad_i in zip(seeds, grads):
+                    torch.manual_seed(seed_i)
+                    z0 = torch.normal(mean=0, std=1, size=(U.shape[1], V.shape[0]),
+                                      device=param.data.device, dtype=param.data.dtype)
+                    g = grad_i * z0
+                    if avg_grad_subspace is None:
+                        avg_grad_subspace = g
+                    else:
+                        avg_grad_subspace = avg_grad_subspace + g
+                avg_grad_subspace = avg_grad_subspace / q
+
+                # SGD momentum on the averaged (lower-variance) gradient
                 if name not in self.zo_subspace_momentum:
-                    self.zo_subspace_momentum[name] = torch.zeros_like(z0)
+                    self.zo_subspace_momentum[name] = torch.zeros_like(avg_grad_subspace)
 
                 self.zo_subspace_momentum[name] = (
-                    beta_m * self.zo_subspace_momentum[name] + grad_subspace
+                    beta_m * self.zo_subspace_momentum[name] + avg_grad_subspace
                 )
 
                 # Project momentum back to full parameter space and update
@@ -1383,10 +1426,18 @@ class OurTrainer(Trainer):
                     param.data.shape).to(param.data.dtype)
                 param.data -= lr * update
             else:
-                # 1D params (bias/layernorm): standard ZO update via optimizer
-                z = torch.normal(mean=0, std=1, size=param.data.size(),
-                                 device=param.data.device, dtype=param.data.dtype)
-                param.grad = self.projected_grad * z
+                # 1D params: average gradient over q perturbations
+                avg_grad = None
+                for seed_i, grad_i in zip(seeds, grads):
+                    torch.manual_seed(seed_i)
+                    z = torch.normal(mean=0, std=1, size=param.data.size(),
+                                     device=param.data.device, dtype=param.data.dtype)
+                    g = grad_i * z
+                    if avg_grad is None:
+                        avg_grad = g
+                    else:
+                        avg_grad = avg_grad + g
+                param.grad = avg_grad / q
                 self.optimizer.step()
                 param.grad = None
 
