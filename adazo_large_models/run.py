@@ -113,7 +113,7 @@ class OurArguments(TrainingArguments):
 
     # --- AdaSub-ZO Specific Arguments ---
     adasub_lr: float = 1e-2     # Learning rate for learning U and V (Phase 1)
-    adasub_iter: int = 10       # How many optimization steps to learn U and V per cycle
+    adasub_iter: int = 20       # How many optimization steps to learn U and V per cycle
     adasub_alpha: float = 1e-3  # The probe step size (alpha) in the objective function
     adasub_sigma: float = 1e-2  # Perturbation scale (nu) for ZO estimation of U and V
     adasub_beta: float = 0.9    # Momentum coefficient for Subspace Fusion
