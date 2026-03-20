@@ -1305,6 +1305,11 @@ class OurTrainer(Trainer):
             # Reset model back to its parameters at start of step
             self.zo_subspace_perturb_parameters(scaling_factor=1)
 
+        # Clip gradient estimate to prevent outliers from destabilizing training
+        grad_clip = getattr(args, 'grad_clip_value', 5.0)
+        if grad_clip > 0:
+            self.projected_grad = max(-grad_clip, min(grad_clip, self.projected_grad))
+
         return loss1
 
 
@@ -1357,9 +1362,11 @@ class OurTrainer(Trainer):
             # Linear warmup: 0 -> lr over warmup_steps
             lr = args.learning_rate * (step + 1) / warmup_steps
         elif args.lr_scheduler_type == 'cosine' and args.max_steps > 0:
-            # Cosine decay after warmup
+            # Cosine decay after warmup, with minimum floor
+            cosine_min_ratio = getattr(args, 'cosine_min_ratio', 0.1)
+            lr_min = args.learning_rate * cosine_min_ratio
             progress = min((step - warmup_steps) / (args.max_steps - warmup_steps), 1.0)
-            lr = args.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
+            lr = lr_min + (args.learning_rate - lr_min) * 0.5 * (1 + math.cos(math.pi * progress))
         else:
             lr = args.learning_rate
 
