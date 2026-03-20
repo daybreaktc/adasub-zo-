@@ -1222,17 +1222,7 @@ class OurTrainer(Trainer):
         args = self.args
                 
         # 1. Check if we need to Learn/Update the Subspace (Phase 1)
-        # Adaptive interval: frequent updates early, sparse updates late
-        if getattr(args, 'adaptive_interval', False) and args.max_steps > 0:
-            progress = min(self.state.global_step / args.max_steps, 1.0)
-            interval_min = getattr(args, 'interval_min', 50)
-            interval_max = getattr(args, 'interval_max', 200)
-            # Linear interpolation: interval grows from min to max over training
-            current_interval = int(interval_min + progress * (interval_max - interval_min))
-            current_interval = max(current_interval, 1)
-            is_time_to_update = (self.state.global_step % current_interval == 0)
-        else:
-            is_time_to_update = (self.state.global_step % args.update_interval == 0)
+        is_time_to_update = (self.state.global_step % args.update_interval == 0)
         
         # Initialize p_state structure if empty
         if not self.p_state: 
