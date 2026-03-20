@@ -1352,14 +1352,16 @@ class OurTrainer(Trainer):
         # === LR Schedule: linear warmup + cosine decay ===
         warmup_steps = getattr(args, 'warmup_steps', 200)
         step = self.state.global_step
+        cosine_min_ratio = getattr(args, 'cosine_min_ratio', 0.1)
 
         if step < warmup_steps:
             # Linear warmup: 0 -> lr over warmup_steps
             lr = args.learning_rate * (step + 1) / warmup_steps
         elif args.lr_scheduler_type == 'cosine' and args.max_steps > 0:
-            # Cosine decay after warmup
+            # Cosine decay after warmup: lr_max -> lr_min
+            lr_min = args.learning_rate * cosine_min_ratio
             progress = min((step - warmup_steps) / (args.max_steps - warmup_steps), 1.0)
-            lr = args.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
+            lr = lr_min + (args.learning_rate - lr_min) * 0.5 * (1 + math.cos(math.pi * progress))
         else:
             lr = args.learning_rate
 
