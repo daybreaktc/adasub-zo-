@@ -1388,52 +1388,50 @@ class OurTrainer(Trainer):
             lr = args.learning_rate
 
         # Multi-perturbation: accumulate gradient from all q directions
+        # CRITICAL: seed must be set once per perturbation *outside* the param loop,
+        # so each param consumes the same z sequence as in zo_subspace_perturb_parameters.
         seeds = getattr(self, 'zo_random_seeds', [self.zo_random_seed])
         grads = getattr(self, 'projected_grads', [self.projected_grad])
         q = len(seeds)
 
-        for name, param, U, V in self.named_parameters_to_optim:
-            if len(torch.squeeze(param.data).shape) == 2:
-                scale = math.sqrt(param.data.numel() / (U.shape[1] * V.shape[0]))
-
-                # Average gradient over q perturbations
-                avg_grad_subspace = None
-                for seed_i, grad_i in zip(seeds, grads):
-                    torch.manual_seed(seed_i)
+        # Pass 1: replay each seed to collect per-param gradient contributions
+        grad_accum = {}  # name -> accumulated grad (subspace or full)
+        for seed_i, grad_i in zip(seeds, grads):
+            torch.manual_seed(seed_i)
+            for name, param, U, V in self.named_parameters_to_optim:
+                if len(torch.squeeze(param.data).shape) == 2:
                     z0 = torch.normal(mean=0, std=1, size=(U.shape[1], V.shape[0]),
                                       device=param.data.device, dtype=param.data.dtype)
                     g = grad_i * z0
-                    if avg_grad_subspace is None:
-                        avg_grad_subspace = g
-                    else:
-                        avg_grad_subspace = avg_grad_subspace + g
-                avg_grad_subspace = avg_grad_subspace / q
+                else:
+                    z = torch.normal(mean=0, std=1, size=param.data.size(),
+                                     device=param.data.device, dtype=param.data.dtype)
+                    g = grad_i * z
 
-                # SGD momentum on the averaged (lower-variance) gradient
+                if name not in grad_accum:
+                    grad_accum[name] = g
+                else:
+                    grad_accum[name] = grad_accum[name] + g
+
+        # Pass 2: apply averaged gradient with momentum
+        for name, param, U, V in self.named_parameters_to_optim:
+            avg_g = grad_accum[name] / q
+
+            if len(torch.squeeze(param.data).shape) == 2:
+                scale = math.sqrt(param.data.numel() / (U.shape[1] * V.shape[0]))
+
                 if name not in self.zo_subspace_momentum:
-                    self.zo_subspace_momentum[name] = torch.zeros_like(avg_grad_subspace)
+                    self.zo_subspace_momentum[name] = torch.zeros_like(avg_g)
 
                 self.zo_subspace_momentum[name] = (
-                    beta_m * self.zo_subspace_momentum[name] + avg_grad_subspace
+                    beta_m * self.zo_subspace_momentum[name] + avg_g
                 )
 
-                # Project momentum back to full parameter space and update
                 update = (U @ self.zo_subspace_momentum[name] @ V * scale).view(
                     param.data.shape).to(param.data.dtype)
                 param.data -= lr * update
             else:
-                # 1D params: average gradient over q perturbations
-                avg_grad = None
-                for seed_i, grad_i in zip(seeds, grads):
-                    torch.manual_seed(seed_i)
-                    z = torch.normal(mean=0, std=1, size=param.data.size(),
-                                     device=param.data.device, dtype=param.data.dtype)
-                    g = grad_i * z
-                    if avg_grad is None:
-                        avg_grad = g
-                    else:
-                        avg_grad = avg_grad + g
-                param.grad = avg_grad / q
+                param.grad = avg_g
                 self.optimizer.step()
                 param.grad = None
 
