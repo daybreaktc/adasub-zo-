@@ -337,7 +337,7 @@ class OurTrainer(Trainer):
             self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
             # self.optimizer = {name: SGD([param], lr=args.learning_rate) for name, param in self.model.named_parameters()}
             # print(f"### args.lr_scheduler: {args.lr_scheduler_type}")
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."    
+            assert args.lr_scheduler_type in ('constant', 'cosine'), "only support constant or cosine lr schedule."
         else:
             assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
             if args.optimizer == "adam":
@@ -1347,7 +1347,13 @@ class OurTrainer(Trainer):
         """
         args = self.args
         beta_m = getattr(args, 'adasub_beta', 0.9)
-        lr = args.learning_rate
+
+        # Cosine decay: lr decays from lr_max to 0 over max_steps
+        if args.lr_scheduler_type == 'cosine' and args.max_steps > 0:
+            progress = min(self.state.global_step / args.max_steps, 1.0)
+            lr = args.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
+        else:
+            lr = args.learning_rate
 
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(self.zo_random_seed)
