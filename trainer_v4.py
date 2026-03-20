@@ -1248,9 +1248,8 @@ class OurTrainer(Trainer):
             # Project Phase 2 subspace momentum into the new basis
             # Old direction in param space: U_old @ m @ V_old
             # New representation: m_new = (U_new^T @ U_old) @ m @ (V_old @ V_new^T)
-            # Apply damping factor (0.5) to prevent stale momentum from dominating
-            # after a potentially large basis change
-            damping = 0.5
+            # Since U and V are orthonormal (QR), the projection is exact (no information loss)
+            damping = 1.0
             for name in list(self.zo_subspace_momentum.keys()):
                 if name in old_UV and name in self.p_state:
                     U_old, V_old = old_UV[name]
@@ -1341,27 +1340,23 @@ class OurTrainer(Trainer):
 
     def zo_subspace_update(self, model):
         """
-        Update parameters with subspace-internal SGD momentum + improvements:
-        1. Warmup + cosine decay LR schedule
-        2. Nesterov momentum (look-ahead)
+        Update parameters with subspace-internal SGD momentum (LOZO-M style).
+        Momentum lives in the low-rank subspace (r×r), nearly zero memory overhead.
         """
         args = self.args
         beta_m = getattr(args, 'adasub_beta', 0.9)
-        use_nesterov = getattr(args, 'nesterov', True)
 
-        # === LR Schedule: linear warmup + cosine decay ===
-        warmup_steps = getattr(args, 'warmup_steps', 200)
+        # === LR: only use warmup/cosine when explicitly requested ===
         step = self.state.global_step
-        cosine_min_ratio = getattr(args, 'cosine_min_ratio', 0.1)
-
-        if step < warmup_steps:
-            # Linear warmup: 0 -> lr over warmup_steps
-            lr = args.learning_rate * (step + 1) / warmup_steps
-        elif args.lr_scheduler_type == 'cosine' and args.max_steps > 0:
-            # Cosine decay after warmup: lr_max -> lr_min
-            lr_min = args.learning_rate * cosine_min_ratio
-            progress = min((step - warmup_steps) / (args.max_steps - warmup_steps), 1.0)
-            lr = lr_min + (args.learning_rate - lr_min) * 0.5 * (1 + math.cos(math.pi * progress))
+        if args.lr_scheduler_type == 'cosine' and args.max_steps > 0:
+            warmup_steps = getattr(args, 'warmup_steps', 200)
+            cosine_min_ratio = getattr(args, 'cosine_min_ratio', 0.1)
+            if step < warmup_steps:
+                lr = args.learning_rate * (step + 1) / warmup_steps
+            else:
+                lr_min = args.learning_rate * cosine_min_ratio
+                progress = min((step - warmup_steps) / (args.max_steps - warmup_steps), 1.0)
+                lr = lr_min + (args.learning_rate - lr_min) * 0.5 * (1 + math.cos(math.pi * progress))
         else:
             lr = args.learning_rate
 
@@ -1374,7 +1369,7 @@ class OurTrainer(Trainer):
                                   device=param.data.device, dtype=param.data.dtype)
                 scale = math.sqrt(param.data.numel() / z0.numel())
 
-                # SGD-style momentum: m = beta*m + g
+                # Standard SGD momentum: m = beta*m + g (no Nesterov, avoids noise amplification in ZO)
                 grad_subspace = self.projected_grad * z0
                 if name not in self.zo_subspace_momentum:
                     self.zo_subspace_momentum[name] = torch.zeros_like(z0)
@@ -1383,14 +1378,8 @@ class OurTrainer(Trainer):
                     beta_m * self.zo_subspace_momentum[name] + grad_subspace
                 )
 
-                # === Nesterov look-ahead: use beta*m_new + g ===
-                if use_nesterov:
-                    update_subspace = beta_m * self.zo_subspace_momentum[name] + grad_subspace
-                else:
-                    update_subspace = self.zo_subspace_momentum[name]
-
                 # Project momentum back to full parameter space and update
-                update = (U @ update_subspace @ V * scale).view(
+                update = (U @ self.zo_subspace_momentum[name] @ V * scale).view(
                     param.data.shape).to(param.data.dtype)
                 param.data -= lr * update
             else:
