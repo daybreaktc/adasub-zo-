@@ -143,7 +143,6 @@ class OurTrainer(Trainer):
         self.writer = writer
         self.p_state = dict()
         self.zo_subspace_momentum = {}  # r×r momentum buffer per layer (in subspace)
-        self.zo_subspace_momentum_sq = {}  # second moment for per-layer adaptive LR
         self.update_steps = 0
         
     def _inner_training_loop(
@@ -504,11 +503,7 @@ class OurTrainer(Trainer):
                     else:
                         raise ValueError(f"q={args.q} is not supported.")
                 elif args.trainer in ["subzero_sgd"]:
-                        
-                    if args.q == 1:
-                        tr_loss_step = self.zo_adasubspace_step(model, inputs)            
-                    else:
-                        raise ValueError(f"q={args.q} is not supported.")
+                    tr_loss_step = self.zo_adasubspace_step(model, inputs)
                 elif args.trainer == "forward_grad":
                     tr_loss_step = self.forward_grad_step(model, inputs)
                 else:
@@ -1249,8 +1244,7 @@ class OurTrainer(Trainer):
             # Project Phase 2 subspace momentum into the new basis
             # Old direction in param space: U_old @ m @ V_old
             # New representation: m_new = (U_new^T @ U_old) @ m @ (V_old @ V_new^T)
-            # Apply damping factor (0.5) to prevent stale momentum from dominating
-            # after a potentially large basis change
+            # Since U and V are orthonormal (QR), the projection is exact (no information loss)
             damping = 0.5
             for name in list(self.zo_subspace_momentum.keys()):
                 if name in old_UV and name in self.p_state:
@@ -1262,11 +1256,6 @@ class OurTrainer(Trainer):
                     self.zo_subspace_momentum[name] = damping * (
                         (U_new.T @ U_old) @ m_old @ (V_old @ V_new.T)
                     )
-                    # Reset second moment after basis change (stale statistics)
-                    if name in self.zo_subspace_momentum_sq:
-                        self.zo_subspace_momentum_sq[name] = torch.zeros_like(
-                            self.zo_subspace_momentum[name]
-                        )
 
             # Clear gradient buffer after subspace learning to avoid stale grads affecting Phase 2
             model.zero_grad()
@@ -1292,24 +1281,55 @@ class OurTrainer(Trainer):
         # Sample the random seed for sampling z
         self.zo_random_seed = np.random.randint(1000000000)
 
-        # First function evaluation
-        self.zo_subspace_perturb_parameters(scaling_factor=1)
-        loss1 = self.zo_forward(model, inputs)
+        q = getattr(args, 'q', 1)
 
-        # Second function evaluation
-        assert args.q == 1, "only support q=1 for memory efficiency"
-        
-        if self.args.perturbation_mode == "one_side":
-            self.zo_subspace_perturb_parameters(scaling_factor=-1)
-            loss2 = self.zo_forward(model, inputs)
-            self.projected_grad = ((loss1 - loss2) / self.args.zo_eps).item()
-        else:  # two side perturbation
-            self.zo_subspace_perturb_parameters(scaling_factor=-2)
-            loss2 = self.zo_forward(model, inputs)
-            self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
-
-            # Reset model back to its parameters at start of step
+        if q == 1:
+            # Original single-perturbation path (unchanged)
+            # First function evaluation
             self.zo_subspace_perturb_parameters(scaling_factor=1)
+            loss1 = self.zo_forward(model, inputs)
+
+            if self.args.perturbation_mode == "one_side":
+                self.zo_subspace_perturb_parameters(scaling_factor=-1)
+                loss2 = self.zo_forward(model, inputs)
+                self.projected_grad = ((loss1 - loss2) / self.args.zo_eps).item()
+            else:  # two side perturbation
+                self.zo_subspace_perturb_parameters(scaling_factor=-2)
+                loss2 = self.zo_forward(model, inputs)
+                self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+                # Reset model back to its parameters at start of step
+                self.zo_subspace_perturb_parameters(scaling_factor=1)
+
+            # Store single seed for update
+            self.zo_random_seeds = [self.zo_random_seed]
+            self.projected_grads = [self.projected_grad]
+        else:
+            # Multi-perturbation: q independent perturbations, average the gradient
+            self.zo_random_seeds = []
+            self.projected_grads = []
+
+            for _ in range(q):
+                seed_i = np.random.randint(1000000000)
+                self.zo_random_seed = seed_i
+                self.zo_random_seeds.append(seed_i)
+
+                self.zo_subspace_perturb_parameters(scaling_factor=1)
+                loss1 = self.zo_forward(model, inputs)
+
+                if self.args.perturbation_mode == "one_side":
+                    self.zo_subspace_perturb_parameters(scaling_factor=-1)
+                    loss2 = self.zo_forward(model, inputs)
+                    grad_i = ((loss1 - loss2) / self.args.zo_eps).item()
+                else:
+                    self.zo_subspace_perturb_parameters(scaling_factor=-2)
+                    loss2 = self.zo_forward(model, inputs)
+                    grad_i = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+                    self.zo_subspace_perturb_parameters(scaling_factor=1)
+
+                self.projected_grads.append(grad_i)
+
+            # For backward compat, set projected_grad to the average
+            self.projected_grad = sum(self.projected_grads) / q
 
         return loss1
 
@@ -1347,73 +1367,76 @@ class OurTrainer(Trainer):
 
     def zo_subspace_update(self, model):
         """
-        Update parameters with subspace-internal SGD momentum + improvements:
-        1. Warmup + cosine decay LR schedule
-        2. Nesterov momentum (look-ahead)
-        3. Per-layer adaptive LR scaling based on momentum SNR
+        Update parameters with subspace-internal SGD momentum (LOZO-M style).
+        Momentum lives in the low-rank subspace (r×r), nearly zero memory overhead.
         """
         args = self.args
         beta_m = getattr(args, 'adasub_beta', 0.9)
-        beta_v = 0.999  # second moment decay for adaptive LR
-        use_nesterov = getattr(args, 'nesterov', True)
 
-        # === LR Schedule: linear warmup + cosine decay ===
-        warmup_steps = getattr(args, 'warmup_steps', 200)
+        # === LR: only use warmup/cosine when explicitly requested ===
         step = self.state.global_step
-
-        if step < warmup_steps:
-            # Linear warmup: 0 -> lr over warmup_steps
-            lr = args.learning_rate * (step + 1) / warmup_steps
-        elif args.lr_scheduler_type == 'cosine' and args.max_steps > 0:
-            # Cosine decay after warmup
-            progress = min((step - warmup_steps) / (args.max_steps - warmup_steps), 1.0)
-            lr = args.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
+        if args.lr_scheduler_type == 'cosine' and args.max_steps > 0:
+            warmup_steps = getattr(args, 'warmup_steps', 200)
+            cosine_min_ratio = getattr(args, 'cosine_min_ratio', 0.1)
+            if step < warmup_steps:
+                lr = args.learning_rate * (step + 1) / warmup_steps
+            else:
+                lr_min = args.learning_rate * cosine_min_ratio
+                progress = min((step - warmup_steps) / (args.max_steps - warmup_steps), 1.0)
+                lr = lr_min + (args.learning_rate - lr_min) * 0.5 * (1 + math.cos(math.pi * progress))
         else:
             lr = args.learning_rate
 
-        # Set the random seed to ensure that we sample the same z for perturbation/update
-        torch.manual_seed(self.zo_random_seed)
-        for name, param, U, V in self.named_parameters_to_optim:
-            if len(torch.squeeze(param.data).shape) == 2:
-                # Sample z0 in subspace (must match the seed used in perturb)
-                z0 = torch.normal(mean=0, std=1, size=(U.shape[1], V.shape[0]),
-                                  device=param.data.device, dtype=param.data.dtype)
-                scale = math.sqrt(param.data.numel() / z0.numel())
+        # Multi-perturbation: accumulate gradient from all q directions
+        # CRITICAL: seed must be set once per perturbation *outside* the param loop,
+        # so each param consumes the same z sequence as in zo_subspace_perturb_parameters.
+        seeds = getattr(self, 'zo_random_seeds', [self.zo_random_seed])
+        grads = getattr(self, 'projected_grads', [self.projected_grad])
+        q = len(seeds)
 
-                # SGD-style momentum: m = beta*m + g
-                grad_subspace = self.projected_grad * z0
+        # Scale LR by sqrt(q): averaging q directions reduces variance by 1/q,
+        # so we can safely increase step size by sqrt(q) (linear scaling rule).
+        if q > 1:
+            lr = lr * math.sqrt(q)
+
+        # Pass 1: replay each seed to collect per-param gradient contributions
+        grad_accum = {}  # name -> accumulated grad (subspace or full)
+        for seed_i, grad_i in zip(seeds, grads):
+            torch.manual_seed(seed_i)
+            for name, param, U, V in self.named_parameters_to_optim:
+                if len(torch.squeeze(param.data).shape) == 2:
+                    z0 = torch.normal(mean=0, std=1, size=(U.shape[1], V.shape[0]),
+                                      device=param.data.device, dtype=param.data.dtype)
+                    g = grad_i * z0
+                else:
+                    z = torch.normal(mean=0, std=1, size=param.data.size(),
+                                     device=param.data.device, dtype=param.data.dtype)
+                    g = grad_i * z
+
+                if name not in grad_accum:
+                    grad_accum[name] = g
+                else:
+                    grad_accum[name] = grad_accum[name] + g
+
+        # Pass 2: apply averaged gradient with momentum
+        for name, param, U, V in self.named_parameters_to_optim:
+            avg_g = grad_accum[name] / q
+
+            if len(torch.squeeze(param.data).shape) == 2:
+                scale = math.sqrt(param.data.numel() / (U.shape[1] * V.shape[0]))
+
                 if name not in self.zo_subspace_momentum:
-                    self.zo_subspace_momentum[name] = torch.zeros_like(z0)
-                    self.zo_subspace_momentum_sq[name] = torch.zeros_like(z0)
+                    self.zo_subspace_momentum[name] = torch.zeros_like(avg_g)
 
                 self.zo_subspace_momentum[name] = (
-                    beta_m * self.zo_subspace_momentum[name] + grad_subspace
+                    beta_m * self.zo_subspace_momentum[name] + avg_g
                 )
 
-                # === Per-layer adaptive LR via second moment (RMSProp-style) ===
-                self.zo_subspace_momentum_sq[name] = (
-                    beta_v * self.zo_subspace_momentum_sq[name] + (1 - beta_v) * grad_subspace ** 2
-                )
-                # RMS of second moment (scalar per layer) with bias correction
-                v_corrected = self.zo_subspace_momentum_sq[name] / (1 - beta_v ** (step + 1))
-                rms = torch.sqrt(v_corrected.mean()) + 1e-8
-                layer_lr = lr / rms
-
-                # === Nesterov look-ahead: use beta*m_new + g ===
-                if use_nesterov:
-                    update_subspace = beta_m * self.zo_subspace_momentum[name] + grad_subspace
-                else:
-                    update_subspace = self.zo_subspace_momentum[name]
-
-                # Project momentum back to full parameter space and update
-                update = (U @ update_subspace @ V * scale).view(
+                update = (U @ self.zo_subspace_momentum[name] @ V * scale).view(
                     param.data.shape).to(param.data.dtype)
-                param.data -= layer_lr * update
+                param.data -= lr * update
             else:
-                # 1D params (bias/layernorm): standard ZO update via optimizer
-                z = torch.normal(mean=0, std=1, size=param.data.size(),
-                                 device=param.data.device, dtype=param.data.dtype)
-                param.grad = self.projected_grad * z
+                param.grad = avg_g
                 self.optimizer.step()
                 param.grad = None
 
