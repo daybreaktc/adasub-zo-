@@ -503,11 +503,7 @@ class OurTrainer(Trainer):
                     else:
                         raise ValueError(f"q={args.q} is not supported.")
                 elif args.trainer in ["subzero_sgd"]:
-                        
-                    if args.q == 1:
-                        tr_loss_step = self.zo_adasubspace_step(model, inputs)            
-                    else:
-                        raise ValueError(f"q={args.q} is not supported.")
+                    tr_loss_step = self.zo_adasubspace_step(model, inputs)
                 elif args.trainer == "forward_grad":
                     tr_loss_step = self.forward_grad_step(model, inputs)
                 else:
