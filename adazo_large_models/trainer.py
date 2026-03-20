@@ -327,19 +327,19 @@ class OurTrainer(Trainer):
             self.optimizer = Adam(self.model.parameters(), lr=args.learning_rate)
             # self.optimizer = {name: Adam([param], lr=args.learning_rate) for name, param in self.model.named_parameters()}
             # assert args.lr_scheduler
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
+            assert args.lr_scheduler_type in ('constant', 'cosine'), "only support constant or cosine lr schedule."
         elif args.trainer == "zo_sgd":
             self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
             # self.optimizer = {name: SGD([param], lr=args.learning_rate) for name, param in self.model.named_parameters()}
             # print(f"### args.lr_scheduler: {args.lr_scheduler_type}")
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
+            assert args.lr_scheduler_type in ('constant', 'cosine'), "only support constant or cosine lr schedule."
         elif args.trainer == "subzero_sgd":
             self.optimizer = SGD(self.model.parameters(), lr=args.learning_rate, momentum=args.momentum)
             # self.optimizer = {name: SGD([param], lr=args.learning_rate) for name, param in self.model.named_parameters()}
             # print(f"### args.lr_scheduler: {args.lr_scheduler_type}")
             assert args.lr_scheduler_type in ('constant', 'cosine'), "only support constant or cosine lr schedule."
         else:
-            assert args.lr_scheduler_type == 'constant', "we did not implement lr_schedule."
+            assert args.lr_scheduler_type in ('constant', 'cosine'), "only support constant or cosine lr schedule."
             if args.optimizer == "adam":
                 self.optimizer = Adam(self.model.parameters(), lr=args.learning_rate)
             elif args.optimizer == "sgd":
