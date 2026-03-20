@@ -1233,36 +1233,9 @@ class OurTrainer(Trainer):
                      self.p_state[name] = {'U': None, 'V': None}
 
         if is_time_to_update:
-            # Save old U, V for momentum projection
-            old_UV = {}
-            for name in self.p_state:
-                if self.p_state[name].get('U') is not None:
-                    old_UV[name] = (
-                        self.p_state[name]['U'].clone(),
-                        self.p_state[name]['V'].clone(),
-                    )
-
             # TRIGGER PHASE 1: Learn U and V
             print(f"--> Triggering AdaSub Phase 1: Learning Subspace at step {self.state.global_step}")
             self.train_subspace_basis(model, inputs)
-
-            # Project Phase 2 subspace momentum into the new basis
-            # Old direction in param space: U_old @ m @ V_old
-            # New representation: m_new = (U_new^T @ U_old) @ m @ (V_old @ V_new^T)
-            # Apply damping factor (0.5) to prevent stale momentum from dominating
-            # after a potentially large basis change
-            damping = 0.5
-            for name in list(self.zo_subspace_momentum.keys()):
-                if name in old_UV and name in self.p_state:
-                    U_old, V_old = old_UV[name]
-                    U_new = self.p_state[name]['U']
-                    V_new = self.p_state[name]['V']
-                    m_old = self.zo_subspace_momentum[name]
-                    self.zo_subspace_momentum[name] = damping * (
-                        (U_new.T @ U_old) @ m_old @ (V_old @ V_new.T)
-                    )
-
-            # Clear gradient buffer after subspace learning to avoid stale grads affecting Phase 2
             model.zero_grad()
 
         # 2. Phase 2: Standard SubZero Traversal using the LEARNED U, V
@@ -1341,49 +1314,30 @@ class OurTrainer(Trainer):
 
     def zo_subspace_update(self, model):
         """
-        Update parameters with subspace-internal SGD momentum.
-        For 2D params: accumulate projected_grad * z0 in the r×r subspace where
-        directions are consistent across steps, then project back via U @ m @ V.
+        Update parameters using the estimated gradient projected back to full space.
+        All params go through the optimizer for consistent LR scheduling.
         """
-        args = self.args
-        beta_m = getattr(args, 'adasub_beta', 0.9)
-
-        # Cosine decay: lr decays from lr_max to 0 over max_steps
-        if args.lr_scheduler_type == 'cosine' and args.max_steps > 0:
-            progress = min(self.state.global_step / args.max_steps, 1.0)
-            lr = args.learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
-        else:
-            lr = args.learning_rate
-
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(self.zo_random_seed)
         for name, param, U, V in self.named_parameters_to_optim:
-            if len(torch.squeeze(param.data).shape) == 2:
+            if len(U.shape) == 2:
                 # Sample z0 in subspace (must match the seed used in perturb)
                 z0 = torch.normal(mean=0, std=1, size=(U.shape[1], V.shape[0]),
                                   device=param.data.device, dtype=param.data.dtype)
                 scale = math.sqrt(param.data.numel() / z0.numel())
 
-                # SGD-style momentum: m = beta*m + g
-                # Effective update magnitude grows to g/(1-beta) in steady state
-                grad_subspace = self.projected_grad * z0
-                if name not in self.zo_subspace_momentum:
-                    self.zo_subspace_momentum[name] = torch.zeros_like(z0)
-                self.zo_subspace_momentum[name] = (
-                    beta_m * self.zo_subspace_momentum[name] + grad_subspace
-                )
-
-                # Project momentum back to full parameter space and update
-                update = (U @ self.zo_subspace_momentum[name] @ V * scale).view(
+                # Reconstruct full-space gradient: U @ (g * z0) @ V * scale
+                grad_full = (U @ (self.projected_grad * z0) @ V * scale).view(
                     param.data.shape).to(param.data.dtype)
-                param.data -= lr * update
+                param.grad = grad_full
             else:
-                # 1D params (bias/layernorm): standard ZO update via optimizer
+                # 1D params (bias/layernorm): standard ZO update
                 z = torch.normal(mean=0, std=1, size=param.data.size(),
                                  device=param.data.device, dtype=param.data.dtype)
                 param.grad = self.projected_grad * z
-                self.optimizer.step()
-                param.grad = None
+
+            self.optimizer.step()
+            param.grad = None
 
         self.update_steps += 1
         if self.update_steps % 1000 == 0:
