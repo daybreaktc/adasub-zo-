@@ -1341,23 +1341,13 @@ class OurTrainer(Trainer):
 
     def zo_subspace_update(self, model):
         """
-        Update parameters with subspace-internal momentum (EMA + bias correction).
+        Update parameters with subspace-internal SGD momentum.
         For 2D params: accumulate projected_grad * z0 in the r×r subspace where
         directions are consistent across steps, then project back via U @ m @ V.
         """
         args = self.args
         beta_m = getattr(args, 'adasub_beta', 0.9)
         lr = args.learning_rate
-
-        # Gradient clipping: prevent outlier projected_grad from destabilizing training
-        grad_clip = 5.0
-        self.projected_grad = max(min(self.projected_grad, grad_clip), -grad_clip)
-
-        # Track step count for bias correction (per-layer would be ideal, global is simpler)
-        if not hasattr(self, '_momentum_step_count'):
-            self._momentum_step_count = 0
-        self._momentum_step_count += 1
-        bias_correction = 1 - beta_m ** self._momentum_step_count
 
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(self.zo_random_seed)
@@ -1368,20 +1358,17 @@ class OurTrainer(Trainer):
                                   device=param.data.device, dtype=param.data.dtype)
                 scale = math.sqrt(param.data.numel() / z0.numel())
 
-                # EMA-style momentum: m = beta*m + (1-beta)*g
-                # This keeps the effective update magnitude ~= g (not g/(1-beta))
+                # SGD-style momentum: m = beta*m + g
+                # Effective update magnitude grows to g/(1-beta) in steady state
                 grad_subspace = self.projected_grad * z0
                 if name not in self.zo_subspace_momentum:
                     self.zo_subspace_momentum[name] = torch.zeros_like(z0)
                 self.zo_subspace_momentum[name] = (
-                    beta_m * self.zo_subspace_momentum[name] + (1 - beta_m) * grad_subspace
+                    beta_m * self.zo_subspace_momentum[name] + grad_subspace
                 )
 
-                # Bias-corrected momentum (Adam-style warm-up fix)
-                m_corrected = self.zo_subspace_momentum[name] / bias_correction
-
                 # Project momentum back to full parameter space and update
-                update = (U @ m_corrected @ V * scale).view(
+                update = (U @ self.zo_subspace_momentum[name] @ V * scale).view(
                     param.data.shape).to(param.data.dtype)
                 param.data -= lr * update
             else:
