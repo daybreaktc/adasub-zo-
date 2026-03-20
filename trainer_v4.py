@@ -143,7 +143,6 @@ class OurTrainer(Trainer):
         self.writer = writer
         self.p_state = dict()
         self.zo_subspace_momentum = {}  # r×r momentum buffer per layer (in subspace)
-        self.zo_subspace_momentum_sq = {}  # second moment for per-layer adaptive LR
         self.update_steps = 0
         
     def _inner_training_loop(
@@ -1262,11 +1261,6 @@ class OurTrainer(Trainer):
                     self.zo_subspace_momentum[name] = damping * (
                         (U_new.T @ U_old) @ m_old @ (V_old @ V_new.T)
                     )
-                    # Reset second moment after basis change (stale statistics)
-                    if name in self.zo_subspace_momentum_sq:
-                        self.zo_subspace_momentum_sq[name] = torch.zeros_like(
-                            self.zo_subspace_momentum[name]
-                        )
 
             # Clear gradient buffer after subspace learning to avoid stale grads affecting Phase 2
             model.zero_grad()
@@ -1350,11 +1344,9 @@ class OurTrainer(Trainer):
         Update parameters with subspace-internal SGD momentum + improvements:
         1. Warmup + cosine decay LR schedule
         2. Nesterov momentum (look-ahead)
-        3. Per-layer adaptive LR scaling based on momentum SNR
         """
         args = self.args
         beta_m = getattr(args, 'adasub_beta', 0.9)
-        beta_v = 0.999  # second moment decay for adaptive LR
         use_nesterov = getattr(args, 'nesterov', True)
 
         # === LR Schedule: linear warmup + cosine decay ===
@@ -1384,20 +1376,10 @@ class OurTrainer(Trainer):
                 grad_subspace = self.projected_grad * z0
                 if name not in self.zo_subspace_momentum:
                     self.zo_subspace_momentum[name] = torch.zeros_like(z0)
-                    self.zo_subspace_momentum_sq[name] = torch.zeros_like(z0)
 
                 self.zo_subspace_momentum[name] = (
                     beta_m * self.zo_subspace_momentum[name] + grad_subspace
                 )
-
-                # === Per-layer adaptive LR via second moment (RMSProp-style) ===
-                self.zo_subspace_momentum_sq[name] = (
-                    beta_v * self.zo_subspace_momentum_sq[name] + (1 - beta_v) * grad_subspace ** 2
-                )
-                # RMS of second moment (scalar per layer) with bias correction
-                v_corrected = self.zo_subspace_momentum_sq[name] / (1 - beta_v ** (step + 1))
-                rms = torch.sqrt(v_corrected.mean()) + 1e-8
-                layer_lr = lr / rms
 
                 # === Nesterov look-ahead: use beta*m_new + g ===
                 if use_nesterov:
@@ -1408,7 +1390,7 @@ class OurTrainer(Trainer):
                 # Project momentum back to full parameter space and update
                 update = (U @ update_subspace @ V * scale).view(
                     param.data.shape).to(param.data.dtype)
-                param.data -= layer_lr * update
+                param.data -= lr * update
             else:
                 # 1D params (bias/layernorm): standard ZO update via optimizer
                 z = torch.normal(mean=0, std=1, size=param.data.size(),
