@@ -1245,7 +1245,7 @@ class OurTrainer(Trainer):
             # Old direction in param space: U_old @ m @ V_old
             # New representation: m_new = (U_new^T @ U_old) @ m @ (V_old @ V_new^T)
             # Since U and V are orthonormal (QR), the projection is exact (no information loss)
-            damping = 1.0
+            damping = 0.5
             for name in list(self.zo_subspace_momentum.keys()):
                 if name in old_UV and name in self.p_state:
                     U_old, V_old = old_UV[name]
@@ -1393,6 +1393,11 @@ class OurTrainer(Trainer):
         seeds = getattr(self, 'zo_random_seeds', [self.zo_random_seed])
         grads = getattr(self, 'projected_grads', [self.projected_grad])
         q = len(seeds)
+
+        # Scale LR by sqrt(q): averaging q directions reduces variance by 1/q,
+        # so we can safely increase step size by sqrt(q) (linear scaling rule).
+        if q > 1:
+            lr = lr * math.sqrt(q)
 
         # Pass 1: replay each seed to collect per-param gradient contributions
         grad_accum = {}  # name -> accumulated grad (subspace or full)
