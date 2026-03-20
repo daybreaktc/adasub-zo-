@@ -1399,13 +1399,15 @@ class OurTrainer(Trainer):
                     param.data.shape).to(param.data.dtype)
                 param.data -= lr * update
             else:
-                # 1D params (bias/layernorm): use same custom LR schedule as 2D params
+                # 1D params (bias/layernorm): standard ZO update via optimizer (AdamW)
                 z = torch.normal(mean=0, std=1, size=param.data.size(),
                                  device=param.data.device, dtype=param.data.dtype)
-                param.data -= lr * self.projected_grad * z
+                param.grad = self.projected_grad * z
+                self.optimizer.step()
+                param.grad = None
 
         self.update_steps += 1
-        if self.update_steps % 100 == 0:
+        if self.update_steps % 1000 == 0:
             print(f'[zo_subspace_update] step={step}, lr={lr:.4e}, projected_grad={self.projected_grad:.4f}')
         self.lr_scheduler.step()
         
