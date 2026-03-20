@@ -118,7 +118,7 @@ class OurArguments(TrainingArguments):
     adasub_sigma: float = 1e-2  # Perturbation scale (nu) for ZO estimation of U and V
     adasub_beta: float = 0.9    # Momentum coefficient for Subspace Fusion
     cosine_min_ratio: float = 0.1  # Minimum LR ratio for cosine decay (lr_min = lr * cosine_min_ratio)
-    grad_clip_value: float = 5.0   # Clip ZO gradient estimates to prevent outliers
+    grad_clip_value: float = 0.0   # Clip ZO gradient estimates (0 = disabled). Typical: ~500 for eps=1e-3
     # ------------------------------------
 
     # Generation

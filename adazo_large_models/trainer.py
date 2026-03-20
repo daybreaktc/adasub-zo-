@@ -1305,8 +1305,8 @@ class OurTrainer(Trainer):
             # Reset model back to its parameters at start of step
             self.zo_subspace_perturb_parameters(scaling_factor=1)
 
-        # Clip gradient estimate to prevent outliers from destabilizing training
-        grad_clip = getattr(args, 'grad_clip_value', 5.0)
+        # Optionally clip gradient estimate (disabled by default, 0 = no clip)
+        grad_clip = getattr(args, 'grad_clip_value', 0.0)
         if grad_clip > 0:
             self.projected_grad = max(-grad_clip, min(grad_clip, self.projected_grad))
 
@@ -1399,16 +1399,14 @@ class OurTrainer(Trainer):
                     param.data.shape).to(param.data.dtype)
                 param.data -= lr * update
             else:
-                # 1D params (bias/layernorm): standard ZO update via optimizer
+                # 1D params (bias/layernorm): use same custom LR schedule as 2D params
                 z = torch.normal(mean=0, std=1, size=param.data.size(),
                                  device=param.data.device, dtype=param.data.dtype)
-                param.grad = self.projected_grad * z
-                self.optimizer.step()
-                param.grad = None
+                param.data -= lr * self.projected_grad * z
 
         self.update_steps += 1
-        if self.update_steps % 1000 == 0:
-            print('model update', self.update_steps)
+        if self.update_steps % 100 == 0:
+            print(f'[zo_subspace_update] step={step}, lr={lr:.4e}, projected_grad={self.projected_grad:.4f}')
         self.lr_scheduler.step()
         
     @staticmethod
